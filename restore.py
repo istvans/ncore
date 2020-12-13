@@ -1,3 +1,6 @@
+from collections import namedtuple
+import os
+import re
 import sys
 from typing import Any, Optional
 
@@ -9,6 +12,40 @@ from transmission_rpc import Client
 
 OptionalString = Optional[str]
 PageType = requests.models.Response
+
+
+def eprint(*args, **kwargs):
+    """Print to standard error"""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+class UserInputWasCancelled(Exception):
+    """Should be raised when the user cancels an interactive input session"""
+
+
+def get_from_user(named_thing, parse_from_string, choices):
+    """Try to get the named thing as the result of `parse_from_string` from the user
+    TODO extract this into a common python package or something like that as this is generally useful stuff that I shouldn't just copy paste...
+    """
+    value = None
+    choices_in_parentheses = choices if isinstance(choices, tuple) else "({})".format(choices)
+    prompt = "{} {}: ".format(named_thing, choices_in_parentheses)
+    while value is None:
+        try:
+            value = input(prompt)
+        except KeyboardInterrupt:
+            raise UserInputWasCancelled() from None
+        try:
+            value = parse_from_string(value)
+        except (TypeError, ValueError):
+            value = None
+        if value is None:
+            eprint("please specify a valid {} (or hit ctrl+c)".format(named_thing))
+        else:
+            if value not in choices:
+                eprint("'{}' is outside of the possible choices: {}".format(value, choices_in_parentheses))
+                value = None
+    return value
 
 
 class Session:
@@ -36,8 +73,7 @@ class Session:
         """
         session_method = getattr(self.__session, method)
 
-        server_url = self.__server_url
-        link_url = server_url if link is None else "{}/{}".format(server_url, link)
+        link_url = self.url(link)
 
         params = {}
         if use_headers:
@@ -50,6 +86,10 @@ class Session:
 
         return response
 
+    def url(self, link: OptionalString = None):
+        server_url = self.__server_url
+        return server_url if link is None else "{}/{}".format(server_url, link)
+
     def start_session(self):
         self.__session = requests.Session()
 
@@ -61,14 +101,11 @@ class Session:
 class nCore:
     __SERVER_URL = "https://ncore.cc"
     __LOGIN_LINK = "login.php"
-    __SEARCH_LINK = "torrents.php"
-    __LOGIN_FORM = {
-        "set_lang": "hu",
-        "submitted": '1',
-    }
     __LOGIN_NAME_FIELD = "nev"
     __LOGIN_PASSWORD_FIELD = "pass"
     __LOGOUT_LINK_PATTERN = "exit.php"
+    __SEARCH_LINK = "torrents.php"
+    __SEARCH_PATTERN_FIELD = "mire"
 
     def __init__(self, name, password):
         self.__name = name
@@ -76,22 +113,35 @@ class nCore:
         self.__session = Session(self.__SERVER_URL)
         self.__logged_in = False
         self.__dynamic_logout_link = None
+        self.__login_form = {
+            "set_lang": "hu",
+            "submitted": '1',
+        }
+        self.__search_form = {
+            "miben": "name",
+            "tipus": "all_own",
+            "submit.x": "34",
+            "submit.y": "7",
+            "tags": "",
+        }
 
     def __enter__(self):
         try:
             self.__session.start_session()
 
-            self.__LOGIN_FORM[self.__LOGIN_NAME_FIELD] = self.__name
-            self.__LOGIN_FORM[self.__LOGIN_PASSWORD_FIELD] = self.__password
+            self.__login_form[self.__LOGIN_NAME_FIELD] = self.__name
+            self.__login_form[self.__LOGIN_PASSWORD_FIELD] = self.__password
 
             print("Logging in... ", end="")
             response = self.__session.request(
-                link=self.__LOGIN_LINK, method="post", data=self.__LOGIN_FORM
+                link=self.__LOGIN_LINK, method="post", data=self.__login_form
             )
             print("We are in :)")
             self.__logged_in = True
             self.__dynamic_logout_link = self.__parse_dynamic_logout_link(
                     response, self.__LOGOUT_LINK_PATTERN)
+
+            return self
         except Exception:
             self.__exit__(*sys.exc_info())
             raise
@@ -114,18 +164,81 @@ class nCore:
 
         self.__session.close_session()
 
+    @staticmethod
+    def __find_result_text(result):
+        return result.a.attrs["title"]
+
     def find(self, pattern, batch_mode):
-        """Try to find a single torrent for `pattern`, download and return it
+        """Try to find and return a single torrent URL for `pattern`.
 
-        The closest match is returned unless `batch_mode` is False.
-        If `batch_mode` is False, the user needs to confirm each torrent.
+        The URL is returned if there is a single match.
+        If multiple torrents match the `pattern` the result depends on the value of `batch_mode`:
+            * True -> None, because we cannot decide in a non-interactive execution
+            * False -> the choosen URL, the user is asked to choose one.
         """
-        return None
+        print("looking for '{}'...".format(pattern))
+        self.__search_form[self.__SEARCH_PATTERN_FIELD] = pattern
+        response = self.__session.request(
+            link=self.__SEARCH_LINK, method="post", data=self.__search_form
+        )
+        soup = BeautifulSoup(response.text, "html.parser")
+        results = soup.find_all("div", {"class": "torrent_txt"})
+        if len(results) > 1:
+            eprint("multiple results:")
+            for (index, result) in enumerate(results):
+                eprint("{}. {}".format(index, self.__find_result_text(result)))
+            if batch_mode:
+                eprint("batch mode means we skip this one")
+            else:
+                result_index_range = range(len(results) - 1)
+                choice = get_from_user("index", int, choices=result_index_range)
+                choice = results[choice]
+        elif len(results) == 1:
+            choice = results[0]
+            print("single result: '{}'".format(self.__find_result_text(choice)))
+        else:
+            eprint("no result")
+            choice = None
+
+        if choice is None:
+            url = None
+        else:
+            raw_link = choice.a.attrs["href"]
+            if match := re.search(r"id=(?P<torrent_id>\d+)", raw_link):
+                torrent_id = int(match.group("torrent_id"))
+            else:
+                eprint("Failed to find an id in this raw_link: '{}'".format(raw_link))
+                torrent_id = None
+
+            if torrent_id is None:
+                url = None
+            else:
+                torrent_link = "ajax.php?action=torrent_drop&id={}".format(torrent_id)
+                torrent_response = self.__session.request(link=torrent_link, method="get")
+                torrent_soup = BeautifulSoup(torrent_response.text, "html.parser")
+                relative_link = torrent_soup.a.attrs["href"]
+                url = self.__session.url(relative_link)
+
+        return url
 
 
-def find_local_folders(existing_torrents):
-    """Return the potential torrent folders excluding the `existing_torrents`"""
-    return []
+Data = namedtuple("Data", "torrent_name, absolute_path")
+
+
+def find_untracked_data(data_dir, existing_torrents):
+    """Return the untracked `Data` points from `data_dir`, excluding the `existing_torrents`"""
+    torrent_names = [t.name for t in existing_torrents]
+    untracked_data = []
+    for (dir_path, dir_names, file_names) in os.walk(data_dir):
+        if dir_names:
+            for torrent_name in torrent_names:
+                if torrent_name in dir_names:
+                    dir_names.remove(torrent_name)
+            dir_names.sort(key=lambda dir_name: os.stat(os.path.join(dir_path, dir_name)).st_mtime)
+        if any([True for file_name in file_names if ".nfo" in file_name]):
+            untracked_data.append(Data(torrent_name=os.path.basename(dir_path),
+                                       absolute_path=dir_path))
+    return untracked_data
 
 
 @click.command()
@@ -144,20 +257,44 @@ def restore(ncore_user, ncore_password, transmission_user, transmission_password
         torrent_client = Client(username=transmission_user, password=transmission_password)
 
         existing_torrents = torrent_client.get_torrents()
-        folders = find_local_folders(existing_torrents)
+        untracked_data = find_untracked_data(data_dir, existing_torrents)
 
         unavailable = []
-        for folder in folders:
-            torrent = ncore.find(folder, batch_mode)
-            if torrent is None:
-                unavailable.append(folder)
+        for (torrent_name, absolute_path) in untracked_data:
+            torrent_url = ncore.find(torrent_name, batch_mode)
+            if torrent_url is None:
+                unavailable.append(torrent_name)
             else:
-                torrent_client.add_torrent(torrent, download_dir=folder)
+                absolute_parent_dir_path = os.path.dirname(absolute_path)
+                print("add torrent:\n    '{}'".format(torrent_url))
+                print("for local data:\n    '{}'".format(absolute_path))
+                torrent = torrent_client.add_torrent(torrent_url, download_dir=absolute_parent_dir_path)
+
+                # torrent.files() returns an empty list... :/
+                files = torrent_client.get_files(torrent.id)[torrent.id]
+                files_unwanted = []
+                for (index, torrent_file) in enumerate(files):
+                    absolute_file_path = os.path.join(absolute_parent_dir_path, torrent_file.name)
+                    if not os.path.isfile(absolute_file_path):
+                        files_unwanted.append(index)
+
+                if files_unwanted:
+                    # do not download anything more than what's already there
+                    # this aims to prevent downloading unwanted samples or renamed files with their
+                    # original names
+                    torrent_client.change_torrent(torrent.id, files_unwanted=files_unwanted)
+
+                files = torrent_client.get_files(torrent.id)[torrent.id]
+                print("selected files:")
+                for torrent_file in files:
+                    if torrent_file.selected:
+                        print("    * {}".format(torrent_file.name))
+            print("=========================================================================")
 
         if unavailable:
             print("Failed to find the source for these items:")
-            for folder in unavailable:
-                print("* {}".format(folder))
+            for torrent_name in unavailable:
+                print("* {}".format(torrent_name))
 
 if __name__ == "__main__":
     restore()
