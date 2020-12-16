@@ -191,8 +191,12 @@ class nCore:
                 eprint("batch mode means we skip this one")
             else:
                 result_index_range = range(len(results) - 1)
-                choice = get_from_user("index", int, choices=result_index_range)
-                choice = results[choice]
+                try:
+                    choice = get_from_user("index", int, choices=result_index_range)
+                    choice = results[choice]
+                except UserInputWasCancelled:
+                    print("\nOK, skipped")
+                    choice = None
         elif len(results) == 1:
             choice = results[0]
             print("single result: '{}'".format(self.__find_result_text(choice)))
