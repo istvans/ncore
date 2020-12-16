@@ -189,6 +189,7 @@ class nCore:
                 eprint("{}. {}".format(index, self.__find_result_text(result)))
             if batch_mode:
                 eprint("batch mode means we skip this one")
+                choice = None
             else:
                 result_index_range = range(len(results) - 1)
                 try:
