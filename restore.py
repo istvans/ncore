@@ -28,7 +28,11 @@ def get_from_user(named_thing, parse_from_string, choices):
     TODO extract this into a common python package or something like that as this is generally useful stuff that I shouldn't just copy paste...
     """
     value = None
-    choices_in_parentheses = choices if isinstance(choices, tuple) else "({})".format(choices)
+    if isinstance(choices, tuple):
+        choices_in_parentheses = choices
+    else:
+        comma_separated_list = ','.join([str(choice) for choice in choices])
+        choices_in_parentheses = "({})".format(comma_separated_list)
     prompt = "{} {}: ".format(named_thing, choices_in_parentheses)
     while value is None:
         try:
@@ -183,7 +187,8 @@ class nCore:
         )
         soup = BeautifulSoup(response.text, "html.parser")
         results = soup.find_all("div", {"class": "torrent_txt"})
-        if len(results) > 1:
+        num_results = len(results)
+        if num_results > 1:
             eprint("multiple results:")
             for (index, result) in enumerate(results):
                 eprint("{}. {}".format(index, self.__find_result_text(result)))
@@ -191,14 +196,14 @@ class nCore:
                 eprint("batch mode means we skip this one")
                 choice = None
             else:
-                result_index_range = range(len(results) - 1)
+                result_index_range = range(num_results)
                 try:
                     choice = get_from_user("index", int, choices=result_index_range)
                     choice = results[choice]
                 except UserInputWasCancelled:
                     print("\nOK, skipped")
                     choice = None
-        elif len(results) == 1:
+        elif num_results == 1:
             choice = results[0]
             print("single result: '{}'".format(self.__find_result_text(choice)))
         else:
